@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import * as ejs from 'ejs';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { WebSocket, WebSocketServer } from 'ws';
 
 /**
  * Interface representing a stored photo with metadata
@@ -15,6 +16,15 @@ interface StoredPhoto {
   mimeType: string;
   filename: string;
   size: number;
+}
+
+/**
+ * Streaming modes for different capture rates
+ */
+enum StreamingMode {
+  OFF = 'off',
+  PHOTO_SLOW = 'photo_slow',    // 1 photo every 2 seconds
+  PHOTO_FAST = 'photo_fast'     // 2 photos per second
 }
 
 
@@ -32,6 +42,11 @@ class ExampleMentraOSApp extends AppServer {
   private isStreamingPhotos: Map<string, boolean> = new Map(); // Track if we are streaming photos for a user
   private nextPhotoTime: Map<string, number> = new Map(); // Track next photo time for a user
   private activeRequests: Map<string, boolean> = new Map(); // Track active requests per user
+  
+  // WebSocket streaming properties
+  private wss: WebSocketServer;
+  private activeStreams: Map<string, WebSocket[]> = new Map(); // WebSocket clients per user
+  private streamingMode: Map<string, StreamingMode> = new Map(); // Current streaming mode per user
 
   constructor() {
     super({
@@ -40,6 +55,78 @@ class ExampleMentraOSApp extends AppServer {
       port: PORT,
     });
     this.setupWebviewRoutes();
+    this.setupWebSocketServer();
+  }
+
+  /**
+   * Setup WebSocket server for real-time streaming
+   */
+  private setupWebSocketServer(): void {
+    this.wss = new WebSocketServer({ port: 8080 });
+    
+    this.wss.on('connection', (ws: WebSocket, req) => {
+      this.logger.info('New WebSocket connection established');
+      
+      // For now, add to a general stream (we'll improve this later with user-specific streams)
+      if (!this.activeStreams.has('general')) {
+        this.activeStreams.set('general', []);
+      }
+      this.activeStreams.get('general')!.push(ws);
+      
+      ws.on('close', () => {
+        this.logger.info('WebSocket connection closed');
+        this.removeWebSocket('general', ws);
+      });
+      
+      ws.on('error', (error) => {
+        this.logger.error(`WebSocket error: ${error}`);
+        this.removeWebSocket('general', ws);
+      });
+    });
+    
+    this.logger.info('WebSocket server started on port 8080');
+  }
+
+  /**
+   * Remove a WebSocket from active streams
+   */
+  private removeWebSocket(streamId: string, ws: WebSocket): void {
+    const clients = this.activeStreams.get(streamId);
+    if (clients) {
+      const index = clients.indexOf(ws);
+      if (index > -1) {
+        clients.splice(index, 1);
+      }
+    }
+  }
+
+  /**
+   * Broadcast photo to all connected WebSocket clients
+   */
+  private broadcastPhoto(photo: StoredPhoto): void {
+    const clients = this.activeStreams.get('general') || [];
+    const base64Data = photo.buffer.toString('base64');
+    
+    const message = JSON.stringify({
+      type: 'photo',
+      data: base64Data,
+      mimeType: photo.mimeType,
+      timestamp: photo.timestamp.getTime(),
+      size: photo.size
+    });
+    
+    clients.forEach(ws => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(message);
+        } catch (error) {
+          this.logger.error(`Error sending WebSocket message: ${error}`);
+          this.removeWebSocket('general', ws);
+        }
+      }
+    });
+    
+    this.logger.debug(`Broadcasted photo to ${clients.length} WebSocket clients`);
   }
 
   /**
@@ -106,8 +193,8 @@ class ExampleMentraOSApp extends AppServer {
     setInterval(async () => {
       if (this.isStreamingPhotos.get(userId) && Date.now() > (this.nextPhotoTime.get(userId) ?? 0)) {
         try {
-          // set the next photo for 5 seconds from now
-          this.nextPhotoTime.set(userId, Date.now() + 1000);
+          // set the next photo for 2 seconds from now (photo streaming rate, not video rate)
+          this.nextPhotoTime.set(userId, Date.now() + 2000);
 
           // Check if no request is in progress, then start one
           if (!this.activeRequests.get(userId)) {
@@ -155,6 +242,9 @@ class ExampleMentraOSApp extends AppServer {
     // update the latest photo timestamp
     this.latestPhotoTimestamp.set(userId, cachedPhoto.timestamp.getTime());
     this.logger.info(`Photo cached for user ${userId}, timestamp: ${cachedPhoto.timestamp}`);
+    
+    // Broadcast photo to WebSocket clients for real-time streaming
+    this.broadcastPhoto(cachedPhoto);
     
     // Save the photo to the current folder
     try {
@@ -305,40 +395,142 @@ class ExampleMentraOSApp extends AppServer {
               font-size: 18px;
               margin: 50px 0;
             }
-            .refresh-info {
-              font-size: 12px;
-              color: #666;
-              margin-top: 20px;
+            .stream-controls {
+              margin: 20px 0;
+              display: flex;
+              gap: 10px;
+              justify-content: center;
+              flex-wrap: wrap;
+            }
+            .mode-btn {
+              background-color: #333;
+              color: white;
+              border: none;
+              padding: 10px 20px;
+              border-radius: 5px;
+              cursor: pointer;
+              font-size: 14px;
+              transition: background-color 0.3s;
+            }
+            .mode-btn:hover {
+              background-color: #555;
+            }
+            .mode-btn.active {
+              background-color: #28a745;
+            }
+            .stream-info {
+              margin: 20px 0;
+              padding: 15px;
+              background-color: rgba(255, 255, 255, 0.1);
+              border-radius: 8px;
+              display: inline-block;
+              text-align: left;
+            }
+            .stream-info > div {
+              margin: 5px 0;
+              font-size: 14px;
             }
           </style>
         </head>
         <body>
           <div class="container">
             <h1>🥽 Glass Camera Stream</h1>
-            ${latestPhoto ? `
-              <div class="info">
-                Latest capture: ${latestPhoto.timestamp.toLocaleString()}<br>
-                Size: ${Math.round(latestPhoto.size / 1024)}KB
-              </div>
-              <div class="image-container">
-                <img class="latest-image" src="data:${latestPhoto.mimeType};base64,${latestPhoto.buffer.toString('base64')}" alt="Latest capture" />
-              </div>
-            ` : `
-              <div class="no-image">
-                No images captured yet.<br>
-                Connect your Glass device and take a photo!
-              </div>
-            `}
-            <div class="refresh-info">
-              Page auto-refreshes every 2 seconds
+            
+            <div class="stream-controls">
+              <button id="mode-off" class="mode-btn">Stop</button>
+              <button id="mode-slow" class="mode-btn">Slow (0.5 FPS)</button>
+              <button id="mode-fast" class="mode-btn">Fast (2 FPS)</button>
+            </div>
+            
+            <div class="stream-info">
+              <div>Mode: <span id="current-mode">Off</span></div>
+              <div>FPS: <span id="current-fps">0</span></div>
+              <div>Last Update: <span id="last-update">Never</span></div>
+              <div>Connection: <span id="connection-status">Connecting...</span></div>
+            </div>
+            
+            <div class="image-container">
+              ${latestPhoto ? `
+                <img id="stream-image" class="latest-image" src="data:${latestPhoto.mimeType};base64,${latestPhoto.buffer.toString('base64')}" alt="Live stream" />
+              ` : `
+                <div id="no-image" class="no-image">
+                  No images captured yet.<br>
+                  Connect your Glass device and take a photo!
+                </div>
+              `}
             </div>
           </div>
           
           <script>
-            // Auto-refresh every 2 seconds to show latest image
-            setTimeout(() => {
-              window.location.reload();
-            }, 2000);
+            // WebSocket connection for real-time streaming
+            const ws = new WebSocket('ws://localhost:8080');
+            let frameCount = 0;
+            let lastFpsUpdate = Date.now();
+            
+            ws.onopen = () => {
+              document.getElementById('connection-status').textContent = 'Connected';
+              document.getElementById('connection-status').style.color = '#28a745';
+            };
+            
+            ws.onclose = () => {
+              document.getElementById('connection-status').textContent = 'Disconnected';
+              document.getElementById('connection-status').style.color = '#dc3545';
+            };
+            
+            ws.onerror = () => {
+              document.getElementById('connection-status').textContent = 'Error';
+              document.getElementById('connection-status').style.color = '#dc3545';
+            };
+            
+            ws.onmessage = (event) => {
+              const data = JSON.parse(event.data);
+              
+              if (data.type === 'photo') {
+                // Hide no-image message and show image
+                const noImageDiv = document.getElementById('no-image');
+                if (noImageDiv) noImageDiv.style.display = 'none';
+                
+                // Update or create image element
+                let imgElement = document.getElementById('stream-image');
+                if (!imgElement) {
+                  imgElement = document.createElement('img');
+                  imgElement.id = 'stream-image';
+                  imgElement.className = 'latest-image';
+                  imgElement.alt = 'Live stream';
+                  document.querySelector('.image-container').appendChild(imgElement);
+                }
+                
+                imgElement.src = 'data:' + data.mimeType + ';base64,' + data.data;
+                
+                // Update FPS counter
+                frameCount++;
+                const now = Date.now();
+                if (now - lastFpsUpdate >= 1000) {
+                  document.getElementById('current-fps').textContent = frameCount.toFixed(1);
+                  frameCount = 0;
+                  lastFpsUpdate = now;
+                }
+                
+                document.getElementById('last-update').textContent = 
+                  new Date(data.timestamp).toLocaleTimeString();
+              }
+            };
+            
+            // Mode control buttons (placeholder for now)
+            document.getElementById('mode-off').addEventListener('click', () => {
+              document.getElementById('current-mode').textContent = 'Off';
+              // TODO: Implement mode switching
+            });
+            
+            document.getElementById('mode-slow').addEventListener('click', () => {
+              document.getElementById('current-mode').textContent = 'Slow';
+              // TODO: Implement mode switching
+            });
+            
+            document.getElementById('mode-fast').addEventListener('click', () => {
+              document.getElementById('current-mode').textContent = 'Fast';
+              // TODO: Implement mode switching
+            });
           </script>
         </body>
         </html>

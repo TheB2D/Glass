@@ -10,4 +10,6 @@ bun.lock
 # Logs
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log* 
+yarn-error.log*
+# Photo directory
+photos/*
