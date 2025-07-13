@@ -42,15 +42,74 @@
       text-align: center;
       font-size: 16px;
     }
+
+    .toggle-button {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background-color: #333;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 25px;
+      cursor: pointer;
+      font-size: 16px;
+      z-index: 100;
+    }
+
+    .toggle-button.active {
+      background-color: #28a745;
+    }
   </style>
 </head>
 <body>
+  <button id="toggle-streaming" class="toggle-button">Start Streaming</button>
+  
   <div class="photo-container">
     <div id="content" class="loading">Loading latest photo...</div>
   </div>
 
   <script>
     let currentRequestId = null;
+    let isStreaming = false;
+
+    /**
+     * Toggle streaming mode
+     */
+    async function toggleStreaming() {
+      try {
+        const response = await fetch('/api/toggle-streaming', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to toggle streaming');
+        }
+
+        const result = await response.json();
+        updateStreamingUI(result.isStreaming);
+        
+      } catch (error) {
+        console.error('Error toggling streaming:', error);
+      }
+    }
+
+    /**
+     * Update UI based on streaming state
+     */
+    function updateStreamingUI(streaming) {
+      isStreaming = streaming;
+      const button = document.getElementById('toggle-streaming');
+
+      if (streaming) {
+        button.classList.add('active');
+        button.textContent = 'Stop Streaming';
+      } else {
+        button.classList.remove('active');
+        button.textContent = 'Start Streaming';
+      }
+    }
 
     /**
      * Check for new photos and update display
@@ -72,6 +131,9 @@
 
         const photoInfo = await response.json();
 
+        // Update streaming state
+        updateStreamingUI(photoInfo.isStreaming);
+
         // Check if this is a new photo
         if (photoInfo.requestId !== currentRequestId) {
           currentRequestId = photoInfo.requestId;
@@ -86,6 +148,9 @@
           '<div class="no-photo">Error loading photo. Please refresh the page.</div>';
       }
     }
+
+    // Set up event listeners
+    document.getElementById('toggle-streaming').addEventListener('click', toggleStreaming);
 
     // Check for new photos every 500ms (twice per second)
     checkForNewPhoto(); // Initial check

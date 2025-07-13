@@ -2,6 +2,7 @@ import { AppServer, AppSession, ViewType, AuthenticatedRequest, PhotoData } from
 import { Request, Response } from 'express';
 import * as ejs from 'ejs';
 import * as path from 'path';
+import * as fs from 'fs/promises';
 
 /**
  * Interface representing a stored photo with metadata
@@ -16,6 +17,7 @@ interface StoredPhoto {
   size: number;
 }
 
+
 const PACKAGE_NAME = process.env.PACKAGE_NAME ?? (() => { throw new Error('PACKAGE_NAME is not set in .env file'); })();
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY ?? (() => { throw new Error('MENTRAOS_API_KEY is not set in .env file'); })();
 const PORT = parseInt(process.env.PORT || '3000');
@@ -29,6 +31,7 @@ class ExampleMentraOSApp extends AppServer {
   private latestPhotoTimestamp: Map<string, number> = new Map(); // Track latest photo timestamp per user
   private isStreamingPhotos: Map<string, boolean> = new Map(); // Track if we are streaming photos for a user
   private nextPhotoTime: Map<string, number> = new Map(); // Track next photo time for a user
+  private activeRequests: Map<string, boolean> = new Map(); // Track active requests per user
 
   constructor() {
     super({
@@ -37,6 +40,32 @@ class ExampleMentraOSApp extends AppServer {
       port: PORT,
     });
     this.setupWebviewRoutes();
+  }
+
+  /**
+   * Take a photo asynchronously without blocking
+   */
+  private async takePhotoAsync(userId: string, session: AppSession): Promise<void> {
+    try {
+      this.logger.debug(`Taking photo for user ${userId}`);
+      const photo = await session.camera.requestPhoto();
+      
+      this.logger.info(`Photo completed for user ${userId}`);
+      this.cachePhoto(photo, userId);
+      
+    } catch (error) {
+      // Check for WebSocket disconnection
+      if (error.message && (error.message.includes('WebSocket not connected') || error.message.includes('CLOSED'))) {
+        this.logger.warn(`WebSocket disconnected for user ${userId}, stopping streaming`);
+        // Stop streaming when WebSocket disconnects
+        this.isStreamingPhotos.set(userId, false);
+      } else {
+        this.logger.error(`Photo request failed for user ${userId}: ${error}`);
+      }
+    } finally {
+      // Always clear the active request flag
+      this.activeRequests.set(userId, false);
+    }
   }
 
 
@@ -63,14 +92,12 @@ class ExampleMentraOSApp extends AppServer {
       } else {
         session.layouts.showTextWall("Button pressed, about to take photo", {durationMs: 4000});
         // the user pressed the button, so we take a single photo
-        try {
-          // first, get the photo
-          const photo = await session.camera.requestPhoto();
-          // if there was an error, log it
-          this.logger.info(`Photo taken for user ${userId}, timestamp: ${photo.timestamp}`);
-          this.cachePhoto(photo, userId);
-        } catch (error) {
-          this.logger.error(`Error taking photo: ${error}`);
+        if (!this.activeRequests.get(userId)) {
+          this.activeRequests.set(userId, true);
+          this.logger.info(`Starting manual photo request for user ${userId}`);
+          this.takePhotoAsync(userId, session);
+        } else {
+          this.logger.warn(`Manual photo request skipped for user ${userId} - request already in progress`);
         }
       }
     });
@@ -79,17 +106,16 @@ class ExampleMentraOSApp extends AppServer {
     setInterval(async () => {
       if (this.isStreamingPhotos.get(userId) && Date.now() > (this.nextPhotoTime.get(userId) ?? 0)) {
         try {
-          // set the next photos for 30 seconds from now, as a fallback if this fails
-          this.nextPhotoTime.set(userId, Date.now() + 30000);
+          // set the next photo for 5 seconds from now
+          this.nextPhotoTime.set(userId, Date.now() + 1000);
 
-          // actually take the photo
-          const photo = await session.camera.requestPhoto();
-
-          // set the next photo time to now, since we are ready to take another photo
-          this.nextPhotoTime.set(userId, Date.now());
-
-          // cache the photo for display
-          this.cachePhoto(photo, userId);
+          // Check if no request is in progress, then start one
+          if (!this.activeRequests.get(userId)) {
+            this.activeRequests.set(userId, true);
+            
+            // Start photo request asynchronously without blocking streaming
+            this.takePhotoAsync(userId, session);
+          }
         } catch (error) {
           this.logger.error(`Error auto-taking photo: ${error}`);
         }
@@ -101,6 +127,8 @@ class ExampleMentraOSApp extends AppServer {
     // clean up the user's state
     this.isStreamingPhotos.set(userId, false);
     this.nextPhotoTime.delete(userId);
+    this.activeRequests.delete(userId);
+    
     this.logger.info(`Session stopped for user ${userId}, reason: ${reason}`);
   }
 
@@ -127,6 +155,24 @@ class ExampleMentraOSApp extends AppServer {
     // update the latest photo timestamp
     this.latestPhotoTimestamp.set(userId, cachedPhoto.timestamp.getTime());
     this.logger.info(`Photo cached for user ${userId}, timestamp: ${cachedPhoto.timestamp}`);
+    
+    // Save the photo to the current folder
+    try {
+      // Create photos directory if it doesn't exist
+      const photosDir = path.join(process.cwd(), 'photos');
+      await fs.mkdir(photosDir, { recursive: true });
+      
+      // Create a unique filename based on user ID and timestamp
+      const fileExt = cachedPhoto.mimeType.split('/')[1] || 'jpg';
+      const timestamp = cachedPhoto.timestamp.getTime();
+      const filename = path.join(photosDir, `photo_${userId}_${timestamp}.${fileExt}`);
+      
+      // Write the photo buffer to the file
+      await fs.writeFile(filename, cachedPhoto.buffer);
+      this.logger.info(`Photo saved to disk at: ${filename}`);
+    } catch (error) {
+      this.logger.error(`Error saving photo to disk: ${error}`);
+    }
   }
 
 
@@ -154,7 +200,8 @@ class ExampleMentraOSApp extends AppServer {
       res.json({
         requestId: photo.requestId,
         timestamp: photo.timestamp.getTime(),
-        hasPhoto: true
+        hasPhoto: true,
+        isStreaming: this.isStreamingPhotos.get(userId) || false
       });
     });
 
@@ -200,6 +247,124 @@ class ExampleMentraOSApp extends AppServer {
       const templatePath = path.join(process.cwd(), 'views', 'photo-viewer.ejs');
       const html = await ejs.renderFile(templatePath, {});
       res.send(html);
+    });
+
+    // Root route - displays the latest captured image
+    app.get('/', (req: any, res: any) => {
+      // Get the most recent photo from all users
+      let latestPhoto: StoredPhoto | null = null;
+      let latestTimestamp = 0;
+
+      for (const [userId, photo] of this.photos.entries()) {
+        const photoTimestamp = photo.timestamp.getTime();
+        if (photoTimestamp > latestTimestamp) {
+          latestTimestamp = photoTimestamp;
+          latestPhoto = photo;
+        }
+      }
+
+      const html = `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>Glass Camera Stream</title>
+          <style>
+            body {
+              margin: 0;
+              padding: 20px;
+              background-color: #000;
+              color: white;
+              font-family: Arial, sans-serif;
+              text-align: center;
+            }
+            .container {
+              max-width: 100vw;
+              max-height: 100vh;
+            }
+            .image-container {
+              margin: 20px 0;
+            }
+            .latest-image {
+              max-width: 90vw;
+              max-height: 80vh;
+              object-fit: contain;
+              border-radius: 8px;
+              border: 2px solid #333;
+            }
+            .info {
+              margin: 10px 0;
+              padding: 10px;
+              background-color: rgba(255, 255, 255, 0.1);
+              border-radius: 5px;
+              display: inline-block;
+            }
+            .no-image {
+              color: #888;
+              font-size: 18px;
+              margin: 50px 0;
+            }
+            .refresh-info {
+              font-size: 12px;
+              color: #666;
+              margin-top: 20px;
+            }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <h1>🥽 Glass Camera Stream</h1>
+            ${latestPhoto ? `
+              <div class="info">
+                Latest capture: ${latestPhoto.timestamp.toLocaleString()}<br>
+                Size: ${Math.round(latestPhoto.size / 1024)}KB
+              </div>
+              <div class="image-container">
+                <img class="latest-image" src="data:${latestPhoto.mimeType};base64,${latestPhoto.buffer.toString('base64')}" alt="Latest capture" />
+              </div>
+            ` : `
+              <div class="no-image">
+                No images captured yet.<br>
+                Connect your Glass device and take a photo!
+              </div>
+            `}
+            <div class="refresh-info">
+              Page auto-refreshes every 2 seconds
+            </div>
+          </div>
+          
+          <script>
+            // Auto-refresh every 2 seconds to show latest image
+            setTimeout(() => {
+              window.location.reload();
+            }, 2000);
+          </script>
+        </body>
+        </html>
+      `;
+
+      res.send(html);
+    });
+
+    // API endpoint to toggle streaming mode
+    app.post('/api/toggle-streaming', (req: any, res: any) => {
+      const userId = (req as AuthenticatedRequest).authUserId;
+
+      if (!userId) {
+        res.status(401).json({ error: 'Not authenticated' });
+        return;
+      }
+
+      const currentState = this.isStreamingPhotos.get(userId) || false;
+      this.isStreamingPhotos.set(userId, !currentState);
+      
+      this.logger.info(`Streaming toggled for user ${userId}: ${!currentState}`);
+      
+      res.json({
+        isStreaming: !currentState,
+        message: !currentState ? 'Streaming started' : 'Streaming stopped'
+      });
     });
   }
 }
